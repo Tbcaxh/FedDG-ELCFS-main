@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log
+log.txt
+
+# Models and checkpoints
+model/
+*.pth
+*.pt
+*.ckpt
+
+# Dataset
+dataset/
+
+# Output files
+output/
+*.txt
+!README.md
+
+# Environment files
+environments.txt
+.env
+
+# Temporary files
+*.tmp
+*.temp

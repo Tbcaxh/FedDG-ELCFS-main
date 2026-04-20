@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftoppm -v)",
+      "Bash(pdftotext \"/Users/cc/组会/论文/FedDG Federated Domain Generalization on Medical Image Segmentation.pdf\" -)"
+    ]
+  }
+}

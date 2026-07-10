@@ -36,11 +36,13 @@ model/
 
 # Dataset
 dataset/
+dataset2_processed/
 
 # Output files
 output/
 *.txt
 !README.md
+!requirements_treefeddg.txt
 
 # Environment files
 environments.txt

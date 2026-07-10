@@ -125,42 +125,57 @@ class Logger():
             pickle.dump(self.data, fp, -1)
 
 
+def _get_od_oc_masks(y, threshold=0.5):
+    """Return binary full-disc (OD) and cup (OC) masks.
+
+    The fundus labels use two mutually exclusive channels: disc rim and cup.
+    The anatomical optic disc therefore includes both channels.
+    """
+    y = np.asarray(y)
+    if y.ndim < 3 or y.shape[1] < 2:
+        raise ValueError("Expected masks with shape [N, 2, ...], got {}".format(y.shape))
+
+    rim = y[:, 0, ...] > threshold
+    cup = y[:, 1, ...] > threshold
+    return np.logical_or(rim, cup), cup
+
+
 def _eval_dice(gt_y, pred_y, detail=False):
+    if np.shape(gt_y) != np.shape(pred_y):
+        raise ValueError(
+            "Ground truth and prediction shapes differ: {} vs {}".format(
+                np.shape(gt_y), np.shape(pred_y)
+            )
+        )
 
-    class_map = {  # a map used for mapping label value to its name, used for output
-        "0": "disk",
-        "1": "cup"
-    }
-
+    class_names = ("disk", "cup")
+    gt_masks = _get_od_oc_masks(gt_y)
+    pred_masks = _get_od_oc_masks(pred_y)
     dice = []
 
-    for cls in range(0,2):
-
-        gt = gt_y[:, cls, ...]
-        pred = pred_y[:, cls, ...]
-
-
-        dice_this = 2*np.sum(gt*pred)/(np.sum(gt)+np.sum(pred))
+    for cls, (gt, pred) in enumerate(zip(gt_masks, pred_masks)):
+        denominator = np.count_nonzero(gt) + np.count_nonzero(pred)
+        if denominator == 0:
+            dice_this = 1.0
+        else:
+            intersection = np.count_nonzero(np.logical_and(gt, pred))
+            dice_this = 2.0 * intersection / denominator
         dice.append(dice_this)
 
         if detail is True:
-            #print ("class {}, dice is {:2f}".format(class_map[str(cls)], dice_this))
-            logging.info("class {}, dice is {:2f}".format(class_map[str(cls)], dice_this))
+            logging.info("class %s, dice is %f", class_names[cls], dice_this)
     return dice
 
 def _connectivity_region_analysis(mask):
-    s = [[0,1,0],
-         [1,1,1],
-         [0,1,0]]
-    label_im, nb_labels = ndimage.label(mask)#, structure=s)
+    mask = np.asarray(mask)
+    label_im, nb_labels = ndimage.label(mask)
+    if nb_labels == 0:
+        return np.zeros_like(mask, dtype=np.uint8)
 
-    sizes = ndimage.sum(mask, label_im, range(nb_labels + 1))
-
-    # plt.imshow(label_im)        
-    label_im[label_im != np.argmax(sizes)] = 0
-    label_im[label_im == np.argmax(sizes)] = 1
-
-    return label_im
+    component_ids = np.arange(1, nb_labels + 1)
+    sizes = ndimage.sum(mask, label_im, component_ids)
+    largest_component = component_ids[np.argmax(sizes)]
+    return (label_im == largest_component).astype(np.uint8)
 
 def _eval_average_surface_distances(reference, result, voxelspacing=None, connectivity=1):
     """
@@ -221,12 +236,14 @@ def _eval_haus(pred_y, gt_y, detail=False):
     :param detail:
     :return: a list, indicating Dice of each class for one case
     '''
+    class_names = ("disk", "cup")
+    gt_masks = _get_od_oc_masks(gt_y)
+    pred_masks = _get_od_oc_masks(pred_y)
     haus = []
 
-    for cls in range(0,2):
-
-        gt = gt_y[0, cls, ...]
-        pred = pred_y[0, cls, ...]
+    for cls, (gt, pred) in enumerate(zip(gt_masks, pred_masks)):
+        gt = gt[0]
+        pred = pred[0]
 # def calculate_metric_percase(pred, gt):
 #     dice = metric.binary.dc(pred, gt)
 #     jc = metric.binary.jc(pred, gt)
@@ -236,12 +253,19 @@ def _eval_haus(pred_y, gt_y, detail=False):
         # hausdorff_distance_filter = sitk.HausdorffDistanceImageFilter()
         # hausdorff_distance_filter.Execute(gt_i, pred_i)
         # print (gt.shape)
-        haus_cls = metric.binary.hd95(gt, (pred))
+        gt_nonzero = np.count_nonzero(gt)
+        pred_nonzero = np.count_nonzero(pred)
+        if gt_nonzero == 0 and pred_nonzero == 0:
+            haus_cls = 0.0
+        elif gt_nonzero == 0 or pred_nonzero == 0:
+            haus_cls = np.inf
+        else:
+            haus_cls = metric.binary.hd95(gt, pred)
 
         haus.append(haus_cls)
 
         if detail is True:
-            logging.info("class {}, haus is {:4f}".format(class_map[str(cls)], haus_cls))
+            logging.info("class %s, haus is %f", class_names[cls], haus_cls)
     # logging.info("4 class average haus is {:4f}".format(np.mean(haus)))
 
     return haus

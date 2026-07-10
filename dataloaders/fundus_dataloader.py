@@ -12,23 +12,42 @@ from scipy.ndimage import _ni_support
 from scipy.ndimage.morphology import distance_transform_edt, binary_erosion,\
     generate_binary_structure
 class FundusDataset(TorchDataset):
-    def __init__(self, client_idx=None, freq_site_idx=None, split='train', data_root='dataset', transform=None):
+    _freq_mean_cache = {}
+
+    def __init__(self, client_idx=None, freq_site_idx=None, split='train', data_root='dataset',
+                 transform=None, freq_strategy='mean', freq_perturb_alpha=0.5,
+                 freq_peer_strategy='all', freq_peer_top_k=1, freq_distance_l=0.01):
         self.transform = transform
         self.client_name = [f'client{i}' for i in range(4)]
+        self.client_idx = client_idx
         self.freq_site_index = freq_site_idx or []
+        self.freq_strategy = freq_strategy
+        self.freq_perturb_alpha = freq_perturb_alpha
+        self.freq_peer_strategy = freq_peer_strategy
+        self.freq_peer_top_k = freq_peer_top_k
+        self.freq_distance_l = freq_distance_l
         self.image_list = []
         self.freq_list_clients = []
+        self.freq_mean_clients = []
+        self.freq_proto_clients = []
 
         if split == 'train':
             self.image_list = glob(os.path.join(data_root, self.client_name[client_idx], 'data_npy', '*.npy'))
             for name in self.client_name:
-                freq_list = glob(os.path.join(data_root, name, 'freq_amp_npy', '*.npy'))
+                freq_list = sorted(glob(os.path.join(data_root, name, 'freq_amp_npy', '*.npy')))
                 if len(freq_list) == 0:
                     self.freq_list_clients.append([])
+                    self.freq_mean_clients.append(None)
                     continue
-                # k = max(1, len(freq_list) // 8)
                 self.freq_list_clients.append(freq_list)
+                cache_key = (os.path.abspath(data_root), name)
+                if cache_key not in FundusDataset._freq_mean_cache:
+                    FundusDataset._freq_mean_cache[cache_key] = _compute_mean_amp(freq_list)
+                self.freq_mean_clients.append(FundusDataset._freq_mean_cache[cache_key])
+            self.freq_proto_clients = list(self.freq_mean_clients)
+            self.freq_site_index = self._select_frequency_peers(self.freq_site_index)
         print(f"total {len(self.image_list)} slices")
+        print(f"client{client_idx} frequency peers: {self.freq_site_index}")
 
     def __len__(self):
         return len(self.image_list)
@@ -50,14 +69,12 @@ class FundusDataset(TorchDataset):
         # print ('raw', np.min(image_patch), np.max(image_patch))
 
         # 论文 Section 3.2: "for each external client n≠k, sample an amplitude spectrum"
-        # 即遍历所有外部 client, 每个 client 随机抽一个频谱生成变换图像
+        # 即遍历所有外部 client, 按指定策略生成目标频谱并变换图像
         # 生成 K-1 个变换图像 (K-1 = len(freq_site_index))
         for tar_freq_domain in self.freq_site_index:
-            freq_list = self.freq_list_clients[tar_freq_domain]
-            if len(freq_list) == 0:
+            tar_freq = self._sample_target_freq(tar_freq_domain)
+            if tar_freq is None:
                 continue
-            tar_freq_path = random.choice(freq_list)
-            tar_freq = np.load(tar_freq_path)
             image_patch_freq = source_to_target_freq(image_patch, tar_freq[...], L=0.01)
             image_patch_freq = np.clip(image_patch_freq, 0, 255)
             image_patches = np.concatenate([image_patches, image_patch_freq], axis=-1)
@@ -71,6 +88,110 @@ class FundusDataset(TorchDataset):
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
+
+    def _sample_target_freq(self, tar_freq_domain):
+        freq_list = self.freq_list_clients[tar_freq_domain]
+        mean_freq = self.freq_mean_clients[tar_freq_domain]
+        proto_freq = self.freq_proto_clients[tar_freq_domain]
+
+        if len(freq_list) == 0:
+            return None
+
+        if self.freq_strategy == 'random':
+            return np.load(random.choice(freq_list)).astype(np.float32)
+
+        if mean_freq is None:
+            return None
+
+        if self.freq_strategy == 'mean':
+            return mean_freq
+
+        if self.freq_strategy == 'mean_perturb':
+            sample_freq = np.load(random.choice(freq_list)).astype(np.float32)
+            target_freq = mean_freq + self.freq_perturb_alpha * (sample_freq - mean_freq)
+            return np.maximum(target_freq, 0.0).astype(np.float32)
+
+        if self.freq_strategy == 'ema_mean':
+            return proto_freq
+
+        if self.freq_strategy == 'ema_mean_perturb':
+            sample_freq = np.load(random.choice(freq_list)).astype(np.float32)
+            target_freq = proto_freq + self.freq_perturb_alpha * (sample_freq - proto_freq)
+            return np.maximum(target_freq, 0.0).astype(np.float32)
+
+        raise ValueError('Unsupported freq_strategy: {}'.format(self.freq_strategy))
+
+    def get_initial_freq_prototypes(self):
+        prototypes = []
+        for mean_freq in self.freq_mean_clients:
+            prototypes.append(None if mean_freq is None else mean_freq.copy())
+        return prototypes
+
+    def set_freq_prototypes(self, freq_proto_clients):
+        self.freq_proto_clients = freq_proto_clients
+
+    def sample_client_freq_mean(self, client_idx, sample_size):
+        freq_list = self.freq_list_clients[client_idx]
+        if len(freq_list) == 0:
+            return None
+
+        if sample_size <= 0 or sample_size >= len(freq_list):
+            sampled_freq_list = freq_list
+        else:
+            sampled_freq_list = random.sample(freq_list, sample_size)
+        return _compute_mean_amp(sampled_freq_list)
+
+    def _select_frequency_peers(self, candidate_indices):
+        if self.freq_peer_strategy == 'all' or len(candidate_indices) <= self.freq_peer_top_k:
+            return candidate_indices
+
+        src_mean = self.freq_mean_clients[self.client_idx]
+        if src_mean is None:
+            return candidate_indices
+
+        scored_candidates = []
+        for candidate_idx in candidate_indices:
+            candidate_mean = self.freq_mean_clients[candidate_idx]
+            if candidate_mean is None:
+                continue
+            distance = _low_freq_log_l2_distance(src_mean, candidate_mean, self.freq_distance_l)
+            scored_candidates.append((candidate_idx, distance))
+
+        if len(scored_candidates) == 0:
+            return candidate_indices
+
+        reverse = self.freq_peer_strategy == 'farthest'
+        scored_candidates = sorted(scored_candidates, key=lambda item: item[1], reverse=reverse)
+        top_k = max(1, min(self.freq_peer_top_k, len(scored_candidates)))
+        return [candidate_idx for candidate_idx, _ in scored_candidates[:top_k]]
+
+
+def _compute_mean_amp(freq_list):
+    mean_amp = None
+    for idx, freq_path in enumerate(freq_list):
+        freq_amp = np.load(freq_path).astype(np.float32)
+        if mean_amp is None:
+            mean_amp = np.zeros_like(freq_amp, dtype=np.float32)
+        mean_amp += (freq_amp - mean_amp) / float(idx + 1)
+    return mean_amp
+
+
+def _low_freq_log_l2_distance(amp_a, amp_b, L=0.01):
+    a = np.fft.fftshift(np.log1p(amp_a), axes=(-2, -1))
+    b = np.fft.fftshift(np.log1p(amp_b), axes=(-2, -1))
+
+    _, h, w = a.shape
+    radius = int(np.floor(np.amin((h, w)) * L))
+    c_h = int(np.floor(h / 2.0))
+    c_w = int(np.floor(w / 2.0))
+
+    h1 = c_h - radius
+    h2 = c_h + radius + 1
+    w1 = c_w - radius
+    w2 = c_w + radius + 1
+
+    diff = a[:, h1:h2, w1:w2] - b[:, h1:h2, w1:w2]
+    return float(np.sqrt(np.mean(diff * diff)))
 
 
 def _get_coutour_sample(y_true):
@@ -306,4 +427,3 @@ def source_to_target_freq( src_img, amp_trg, L=0.1 ):
     src_in_trg = np.real(src_in_trg)
 
     return src_in_trg.transpose(1, 2, 0)
-
